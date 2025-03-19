@@ -135,7 +135,18 @@ pub enum CompactionFilter {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
+    /// This is the main synchronization mechanism for the actual data
+    /// Uses RwLock which allows multiple readers but only one writer at a time
+    /// The outer Arc allows sharing the lock across threads
+    /// The inner Arc<LsmStorageState> allows sharing the state data efficiently
+    /// This is used for all read/write operations on the actual data
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
+    /// This is a simpler lock that's used specifically for coordinating state transitions
+    /// It's used in operations that need to ensure atomic state changes
+    /// For example, when freezing a memtable or performing compaction
+    /// The () unit type means it's just used for locking, not protecting any data
+    /// It's more lightweight than the RwLock since it doesn't need to track readers/writers
+    /// this ensures that only one thread can make changes to the state at a time while still allowing concurrent access to the LSM storage
     pub(crate) state_lock: Mutex<()>,
     path: PathBuf,
     pub(crate) block_cache: Arc<BlockCache>,
@@ -294,7 +305,29 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+        // take state lock
+        let state = self.state.read();
+        // The use of snapshot here is purely for code readability and documentation purposes. It helps convey the idea that we're working with a consistent view of the storage state at a particular point in time. This is especially important in concurrent systems where the state could change between operations.
+        // The guard variable itself is already providing the read lock on the state, so there's no functional difference between using guard directly or creating a snapshot reference to it. It's just a matter of code style and clarity.
+        let snapshot = &state;
+        // check memtable
+        if let Some(value) = snapshot.memtable.get(_key) {
+            if value.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(value));
+        }
+        // Search on immutable memtables.
+        for memtable in snapshot.imm_memtables.iter() {
+            if let Some(value) = memtable.get(_key) {
+                if value.is_empty() {
+                    // found tomestone, return key not exists
+                    return Ok(None);
+                }
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -304,12 +337,57 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+        assert!(!_key.is_empty(), "key cannot be empty");
+        assert!(!_value.is_empty(), "value cannot be empty");
+
+        let size: usize;
+        // in smaller scope to release the lock as soon as possible
+        {
+            // take state lock
+            let guard = self.state.read();
+
+            // put into memtable
+            guard.memtable.put(_key, _value)?;
+            size = guard.memtable.approximate_size();
+        }
+        self.try_freeze(size)?;
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+        assert!(!_key.is_empty(), "key cannot be empty");
+
+        let size: usize;
+        // in smaller scope to release the lock as soon as possible
+        {
+            // take state lock
+            // To access the memtable, you will need to take the state lock. As our memtable implementation only requires an immutable reference for put, you ONLY need to take the read lock on state in order to modify the memtable. This allows concurrent access to the memtable from multiple threads.
+            let guard = self.state.read();
+            guard.memtable.put(_key, b"")?;
+
+            size = guard.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)?;
+        Ok(())
+    }
+
+    /// uses "double-checked locking" to avoid unnecessary freezing
+    /// https://en.wikipedia.org/wiki/Double-checked_locking
+    fn try_freeze(&self, estimated_size: usize) -> Result<()> {
+        if estimated_size >= self.options.target_sst_size {
+            // take state lock, and recheck the size again to see if we need to freeze.
+            // This ensures that only one thread freezes in case multiple threads try to freeze at the same time after doing a put or delete.
+            let state_lock = self.state_lock.lock();
+            let guard = self.state.read();
+            // the memtable could have already been frozen, check again to ensure we really need to freeze
+            if guard.memtable.approximate_size() >= self.options.target_sst_size {
+                drop(guard);
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -334,7 +412,22 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let memtable_id = self.next_sst_id();
+        let memtable = Arc::new(MemTable::create(memtable_id));
+
+        let old_memtable;
+        {
+            let mut guard = self.state.write();
+            // Swap the current memtable with a new one.
+            let mut snapshot = guard.as_ref().clone();
+            old_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
+            // Add the memtable to the immutable memtables.
+            snapshot.imm_memtables.insert(0, old_memtable.clone());
+            // Update the snapshot.
+            *guard = Arc::new(snapshot);
+        }
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
