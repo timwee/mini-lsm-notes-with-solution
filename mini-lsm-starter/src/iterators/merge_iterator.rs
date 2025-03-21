@@ -66,7 +66,9 @@ impl<I: StorageIterator> MergeIterator<I> {
                 current: None,
             };
         }
+
         let mut heap = BinaryHeap::new();
+
         if iters.iter().all(|x| !x.is_valid()) {
             // All invalid, select the last one as the current.
             let mut iters = iters;
