@@ -442,6 +442,7 @@ impl LsmStorageInner {
     }
 
     /// Create an iterator over a range of keys.
+    /// FusedIterator -> LsmIterator -> MergeIterator -> [MemTableIterator]
     pub fn scan(
         &self,
         lower: Bound<&[u8]>,

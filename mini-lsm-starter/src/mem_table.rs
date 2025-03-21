@@ -148,6 +148,8 @@ impl MemTable {
     /// Get an iterator over a range of keys.
     pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
         let (lower, upper) = (map_bound(_lower), map_bound(_upper));
+        // MemTableIteratorBuilder is a builder pattern for MemTableIterator from the self_referencing macro from ouroboros crate
+        // TODO: we clone the map here but is it necessary?
         let mut iter = MemTableIteratorBuilder {
             map: self.map.clone(),
             iter_builder: |map| map.range((lower, upper)),
