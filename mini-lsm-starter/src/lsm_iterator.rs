@@ -34,6 +34,7 @@ pub struct LsmIterator {
     is_valid: bool,
 }
 
+// takes care of handling delete tombstones and end bound
 impl LsmIterator {
     pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
         let mut iter = Self {
