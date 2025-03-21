@@ -17,6 +17,16 @@ pub mod merge_iterator;
 pub mod two_merge_iterator;
 
 pub trait StorageIterator {
+    /// The type of the key used by this iterator, defined as a Generic Associated Type (GAT).
+    /// GATs allow us to define types that can be different for each implementation while also
+    /// containing lifetime parameters. This is useful for iterators that may return references
+    /// with different lifetimes.
+    ///
+    /// The type must implement PartialEq, Eq, PartialOrd and Ord to allow key comparisons.
+    ///
+    /// The `where Self: 'a` bound indicates that the implementing type must live at least as
+    /// long as the lifetime 'a. This ensures that any references in KeyType<'a> cannot outlive
+    /// the iterator itself.
     type KeyType<'a>: PartialEq + Eq + PartialOrd + Ord
     where
         Self: 'a;
