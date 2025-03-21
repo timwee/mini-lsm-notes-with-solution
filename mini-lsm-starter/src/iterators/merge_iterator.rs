@@ -92,30 +92,29 @@ impl<I: StorageIterator> MergeIterator<I> {
     }
 }
 
-/// for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> - This is the more complex part:
-/// 1. for<'a> is a higher-ranked trait bound (HRTB) that says "for any lifetime 'a"
-/// 2. StorageIterator is the trait being implemented
-/// 3. <KeyType<'a> = KeySlice<'a>> is an associated type specification that says "the KeyType associated type for any lifetime 'a' must be KeySlice<'a>'"
-/// In simpler terms, this is saying:- The iterator type I must live for the entire program- For any lifetime 'a, I must implement StorageIterator where its key type is KeySlice<'a>
-/// This is a common pattern in Rust when working with iterators that need to handle different lifetimes for their keys. The for<'a> syntax allows the implementation to work with keys of any lifetime, while still maintaining type safety.
-/// A more concrete example might help:
-///
-/// // This would be valid for I
-/// struct MyIterator {
-///     keys: Vec<KeySlice<'static>>,
-/// }
-///
-/// // This would also be valid
-/// struct AnotherIterator<'a> {
-///     keys: Vec<KeySlice<'a>>,
-/// }
-///
-/// // But this would NOT be valid
-/// struct InvalidIterator {
-///     keys: Vec<KeySlice<'a>>, // Error: 'a is not defined
-/// }
-///
-///
+// for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> - This is the more complex part:
+// 1. for<'a> is a higher-ranked trait bound (HRTB) that says "for any lifetime 'a"
+// 2. StorageIterator is the trait being implemented
+// 3. <KeyType<'a> = KeySlice<'a>> is an associated type specification that says "the KeyType associated type for any lifetime 'a' must be KeySlice<'a>'"
+// In simpler terms, this is saying:- The iterator type I must live for the entire program- For any lifetime 'a, I must implement StorageIterator where its key type is KeySlice<'a>
+// This is a common pattern in Rust when working with iterators that need to handle different lifetimes for their keys. The for<'a> syntax allows the implementation to work with keys of any lifetime, while still maintaining type safety.
+// A more concrete example might help:
+// This would be valid for I
+// struct MyIterator {
+//     keys: Vec<KeySlice<'static>>,
+// }
+//
+// // This would also be valid
+// struct AnotherIterator<'a> {
+//     keys: Vec<KeySlice<'a>>,
+// }
+//
+// // But this would NOT be valid
+// struct InvalidIterator {
+//     keys: Vec<KeySlice<'a>>, // Error: 'a is not defined
+// }
+//
+//
 impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIterator
     for MergeIterator<I>
 {

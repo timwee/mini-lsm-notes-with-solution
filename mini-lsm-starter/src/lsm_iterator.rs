@@ -52,6 +52,11 @@ impl LsmIterator {
             self.is_valid = false;
             return Ok(());
         }
+        // Check if the current key is within the end bound range:
+        // - For unbounded range, no additional check is needed
+        // - For inclusive bound, check if current key <= end bound key
+        // - For exclusive bound, check if current key < end bound key
+        // Update is_valid flag accordingly
         match self.end_bound.as_ref() {
             Bound::Unbounded => {}
             Bound::Included(key) => self.is_valid = self.inner.key().raw_ref() <= key.as_ref(),
