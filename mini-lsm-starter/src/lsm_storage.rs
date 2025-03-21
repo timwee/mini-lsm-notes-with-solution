@@ -443,6 +443,11 @@ impl LsmStorageInner {
 
     /// Create an iterator over a range of keys.
     /// FusedIterator -> LsmIterator -> MergeIterator -> [MemTableIterator]
+    /// Each iterator type plays a specific role in the iterator chain:
+    /// 1. FusedIterator: Wraps the LsmIterator and ensures that the iterator is valid before accessing its elements.
+    /// 2. LsmIterator: Represents the main iterator over the LSM tree, handling the logic for traversing multiple levels of the tree.
+    /// 3. MergeIterator: Combines multiple MemTableIterators into a single iterator, managing the merging of overlapping key ranges.
+    /// 4. MemTableIterator: Represents an iterator over a single memtable, providing the actual key-value data.
     pub fn scan(
         &self,
         lower: Bound<&[u8]>,
