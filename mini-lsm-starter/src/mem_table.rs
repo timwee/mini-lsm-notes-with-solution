@@ -18,6 +18,8 @@
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
+use crossbeam_skiplist::map::Entry;
+
 use ouroboros::self_referencing;
 use std::ops::Bound;
 use std::path::Path;
@@ -145,7 +147,28 @@ impl MemTable {
 
     /// Get an iterator over a range of keys.
     pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
-        unimplemented!()
+        let (lower, upper) = (map_bound(_lower), map_bound(_upper));
+        let mut iter = MemTableIteratorBuilder {
+            map: self.map.clone(),
+            iter_builder: |map| map.range((lower, upper)),
+            item: (Bytes::new(), Bytes::new()),
+        }
+        .build();
+        // with_iter_mut is likely a method that provides safe mutable access to the underlying iterator
+        // It takes a closure that receives a mutable reference to the iterator
+        // The closure calls iter.next() to get the next item
+        // MemTableIterator::entry_to_item converts the raw entry into a proper item type
+        let entry = iter.with_iter_mut(|iter| MemTableIterator::entry_to_item(iter.next()));
+        // with_mut is likely a method that provides safe mutable access to the iterator's state
+        // It takes a closure that receives a mutable reference to the iterator's state
+        // The closure assigns the new entry to x.item
+        // This pattern is common when you need to:
+        // 1. Safely access and modify internal state
+        // 2. Ensure proper locking or safety invariants are maintained
+        // 3. Provide controlled access to mutable data
+        // The pattern is similar to how you might use a mutex or other synchronization primitive, but at a higher level of abstraction. It's a way to ensure that modifications to the iterator's state are done safely and consistently.
+        iter.with_mut(|x| *x.item = entry);
+        iter
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
@@ -175,9 +198,30 @@ type SkipMapRangeIter<'a> =
 /// chapter for more information.
 ///
 /// This is part of week 1, day 2.
+///
+/// In standard Rust, you cannot easily create a struct that contains references to its own fields because of the borrow checker rules. For example, this wouldn't work:
+/// struct Problematic {
+///     data: Vec<u8>,
+///     reference: &Vec<u8>, // Can't reference data field!
+/// }
+/// ouroboros is a crate that allows you to create self-referential structs.
+///
+/// In the case below:
+/// struct MemTableIterator {
+///     map: SkipMap<...>,          // The owned data
+///     iter: SkipMapRangeIter<'??>, // Iterator borrowing from map
+/// }
+///
+/// Without the self-referential machinery and these attributes:
+/// - We couldn't express that iter borrows from map in the same struct
+/// - We might run into lifetime issues where the iterator could outlive the data it's iterating over
+/// The combination of self_referencing, borrows, and not_covariant allows us to safely create and use iterators that reference the struct's own data while maintaining Rust's memory safety guarantees.
+///
 #[self_referencing]
 pub struct MemTableIterator {
     /// Stores a reference to the skipmap.
+    /// We want to avoid putting a lifetime on `MemTableIterator` itself
+    ///   that's why we have the underlying skipmap as a member here.
     map: Arc<SkipMap<Bytes, Bytes>>,
     /// Stores a skipmap iterator that refers to the lifetime of `MemTableIterator` itself.
     #[borrows(map)]
@@ -187,22 +231,32 @@ pub struct MemTableIterator {
     item: (Bytes, Bytes),
 }
 
+impl MemTableIterator {
+    fn entry_to_item(entry: Option<Entry<'_, Bytes, Bytes>>) -> (Bytes, Bytes) {
+        entry
+            .map(|x| (x.key().clone(), x.value().clone()))
+            .unwrap_or_else(|| (Bytes::from_static(&[]), Bytes::from_static(&[])))
+    }
+}
+
 impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.borrow_item().1[..]
     }
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        KeySlice::from_slice(&self.borrow_item().0[..])
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.borrow_item().0.is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let entry = self.with_iter_mut(|iter| MemTableIterator::entry_to_item(iter.next()));
+        self.with_mut(|x| *x.item = entry);
+        Ok(())
     }
 }
