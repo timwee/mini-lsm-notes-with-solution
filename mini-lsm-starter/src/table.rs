@@ -161,9 +161,12 @@ impl SsTable {
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         let len = file.size();
+        // read the last 4 bytes to get the offset of the meta block
         let raw_meta_offset = file.read(len - 4, 4)?;
         let block_meta_offset = (&raw_meta_offset[..]).get_u32() as u64;
+        // read the meta block
         let raw_meta = file.read(block_meta_offset, len - 4 - block_meta_offset)?;
+        // decode the meta block
         let block_meta = BlockMeta::decode_block_meta(&raw_meta[..]);
         Ok(Self {
             file,

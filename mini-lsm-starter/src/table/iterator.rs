@@ -60,6 +60,7 @@ impl SsTableIterator {
         let mut blk_idx = table.find_block_idx(key);
         let mut blk_iter =
             BlockIterator::create_and_seek_to_key(table.read_block_cached(blk_idx)?, key);
+        // if the block iterator is not valid, move to the next block
         if !blk_iter.is_valid() {
             blk_idx += 1;
             if blk_idx < table.num_of_blocks() {
@@ -90,6 +91,8 @@ impl SsTableIterator {
     }
 }
 
+/// Also implement `StorageIterator` for `SsTableIterator, so that
+/// it can be composed with other iterators that we have.
 impl StorageIterator for SsTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
