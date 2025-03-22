@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+use crate::iterators::StorageIterator;
+use crate::key::{Key, KeySlice};
 use anyhow::Result;
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -31,11 +33,12 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -305,28 +308,43 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        // take state lock
-        let state = self.state.read();
-        // The use of snapshot here is purely for code readability and documentation purposes. It helps convey the idea that we're working with a consistent view of the storage state at a particular point in time. This is especially important in concurrent systems where the state could change between operations.
-        // The guard variable itself is already providing the read lock on the state, so there's no functional difference between using guard directly or creating a snapshot reference to it. It's just a matter of code style and clarity.
-        let snapshot = &state;
-        // check memtable
-        if let Some(value) = snapshot.memtable.get(_key) {
+    /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        }; // drop global lock here
+
+        // Search on the current memtable.
+        if let Some(value) = snapshot.memtable.get(key) {
             if value.is_empty() {
+                // found tomestone, return key not exists
                 return Ok(None);
             }
             return Ok(Some(value));
         }
+
         // Search on immutable memtables.
         for memtable in snapshot.imm_memtables.iter() {
-            if let Some(value) = memtable.get(_key) {
+            if let Some(value) = memtable.get(key) {
                 if value.is_empty() {
-                    // found tombstone, return key not exists
+                    // found tomestone, return key not exists
                     return Ok(None);
                 }
                 return Ok(Some(value));
             }
+        }
+
+        let mut iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        for table in snapshot.l0_sstables.iter() {
+            iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                snapshot.sstables[table].clone(),
+                KeySlice::from_slice(key),
+            )?));
+        }
+        let iter = MergeIterator::create(iters);
+        if iter.is_valid() && iter.key().raw_ref() == key && !iter.value().is_empty() {
+            return Ok(Some(Bytes::copy_from_slice(iter.value())));
         }
         Ok(None)
     }
@@ -463,7 +481,33 @@ impl LsmStorageInner {
         for memtable in snapshot.imm_memtables.iter() {
             memtable_iters.push(Box::new(memtable.scan(lower, upper)));
         }
-        let iter = MergeIterator::create(memtable_iters);
+        let memtable_iter = MergeIterator::create(memtable_iters);
+
+        let mut table_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        for table_id in snapshot.l0_sstables.iter() {
+            let table = snapshot.sstables[table_id].clone();
+            let iter = match lower {
+                Bound::Included(key) => {
+                    SsTableIterator::create_and_seek_to_key(table, Key::from_slice(key))?
+                }
+                Bound::Excluded(key) => {
+                    let mut iter =
+                        SsTableIterator::create_and_seek_to_key(table, Key::from_slice(key))?;
+                    if iter.is_valid() && iter.key().raw_ref() == key {
+                        iter.next()?;
+                    }
+                    iter
+                }
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
+            };
+
+            table_iters.push(Box::new(iter));
+        }
+
+        let table_iter = MergeIterator::create(table_iters);
+
+        let iter = TwoMergeIterator::create(memtable_iter, table_iter)?;
+
         Ok(FusedIterator::new(LsmIterator::new(
             iter,
             map_bound(upper),
