@@ -19,6 +19,12 @@ use crate::key::{KeySlice, KeyVec};
 use super::{Block, SIZEOF_U16};
 
 /// Builds a block.
+/// As key-value entries are stored in raw format and offsets are stored in a separate vector,
+/// this reduces unnecessary memory allocations and processing overhead when decoding data
+/// —— what you need to do is to simply copy the raw block data to the data vector and
+/// decode the entry offsets every 2 bytes, instead of creating something like
+/// Vec<(Vec<u8>, Vec<u8>)> to store all the key-value pairs in one block in memory.
+/// This compact memory layout is very efficient.
 pub struct BlockBuilder {
     /// Offsets of each key-value entries.
     offsets: Vec<u16>,
