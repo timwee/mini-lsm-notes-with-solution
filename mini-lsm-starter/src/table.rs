@@ -161,11 +161,16 @@ impl SsTable {
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         let len = file.size();
+        // read the last 4 bytes to get the offset of the bloom filter
+        let raw_bloom_offset = file.read(len - 4, 4)?;
+        let bloom_offset = (&raw_bloom_offset[..]).get_u32() as u64;
+        let raw_bloom = file.read(bloom_offset, len - 4 - bloom_offset)?;
+        let bloom_filter = Bloom::decode(&raw_bloom)?;
         // read the last 4 bytes to get the offset of the meta block
-        let raw_meta_offset = file.read(len - 4, 4)?;
+        let raw_meta_offset = file.read(bloom_offset - 4, 4)?;
         let block_meta_offset = (&raw_meta_offset[..]).get_u32() as u64;
         // read the meta block
-        let raw_meta = file.read(block_meta_offset, len - 4 - block_meta_offset)?;
+        let raw_meta = file.read(block_meta_offset, bloom_offset - 4 - block_meta_offset)?;
         // decode the meta block
         let block_meta = BlockMeta::decode_block_meta(&raw_meta[..]);
         Ok(Self {
@@ -176,7 +181,7 @@ impl SsTable {
             block_meta_offset: block_meta_offset as usize,
             id,
             block_cache,
-            bloom: None,
+            bloom: Some(bloom_filter),
             max_ts: 0,
         })
     }

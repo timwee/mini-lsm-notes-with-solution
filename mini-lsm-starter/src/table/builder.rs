@@ -23,7 +23,7 @@ use bytes::BufMut;
 
 use super::{BlockMeta, FileObject, SsTable};
 use crate::key::{Key, KeySlice};
-use crate::{block::BlockBuilder, lsm_storage::BlockCache};
+use crate::{block::BlockBuilder, lsm_storage::BlockCache, table::Bloom};
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
@@ -33,6 +33,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hashes: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -45,6 +46,7 @@ impl SsTableBuilder {
             last_key: Vec::new(),
             block_size,
             builder: BlockBuilder::new(block_size),
+            key_hashes: Vec::new(),
         }
     }
 
@@ -57,6 +59,7 @@ impl SsTableBuilder {
             self.first_key.clear();
             self.first_key.extend(key.raw_ref());
         }
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
 
         // if the key-value pair can be added to the current block
         if self.builder.add(key, value) {
@@ -104,15 +107,28 @@ impl SsTableBuilder {
     ) -> Result<SsTable> {
         self.finish_block();
         // encode, format is
-        // -------------------------------------------------------------------------------------------
-        // |         Block Section         |          Meta Section         |          Extra          |
-        // -------------------------------------------------------------------------------------------
-        // | data block | ... | data block |            metadata           | meta block offset (u32) |
-        // -------------------------------------------------------------------------------------------
+        // -----------------------------------------------------------------------------------------------------
+        // |         Block Section         |                            Meta Section                           |
+        // -----------------------------------------------------------------------------------------------------
+        // | data block | ... | data block | metadata | meta block offset | bloom filter | bloom filter offset |
+        // |                               |  varlen  |         u32       |    varlen    |        u32          |
+        // -----------------------------------------------------------------------------------------------------
+
+        // Build and save metadata
         let mut buf = self.data;
         let meta_offset = buf.len();
         BlockMeta::encode_block_meta(&self.meta, &mut buf);
         buf.put_u32(meta_offset as u32);
+
+        // Build and save bloom filter
+        let bloom = Bloom::build_from_key_hashes(
+            &self.key_hashes,
+            Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01),
+        );
+        let bloom_offset = buf.len();
+        bloom.encode(&mut buf);
+        buf.put_u32(bloom_offset as u32);
+
         let file = FileObject::create(path.as_ref(), buf)?;
         Ok(SsTable {
             id,
@@ -122,7 +138,7 @@ impl SsTableBuilder {
             block_meta: self.meta,
             block_meta_offset: meta_offset,
             block_cache,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }
