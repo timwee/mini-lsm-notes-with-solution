@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use crate::iterators::StorageIterator;
 use crate::key::{Key, KeySlice};
 use anyhow::Result;
 use bytes::Bytes;
@@ -32,6 +31,8 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
@@ -367,7 +368,19 @@ impl LsmStorageInner {
                 )?));
             }
         }
-        let iter = MergeIterator::create(iters);
+        let l0_iter = MergeIterator::create(iters);
+
+        let mut l1_ssts = Vec::with_capacity(snapshot.levels[0].1.len());
+        for table in snapshot.levels[0].1.iter() {
+            let table = snapshot.sstables[table].clone();
+            if keep_table(key, &table) {
+                l1_ssts.push(table);
+            }
+        }
+        let l1_iter = SstConcatIterator::create_and_seek_to_key(l1_ssts, Key::from_slice(key))?;
+
+        let iter = TwoMergeIterator::create(l0_iter, l1_iter)?;
+
         if iter.is_valid() && iter.key().raw_ref() == key && !iter.value().is_empty() {
             return Ok(Some(Bytes::copy_from_slice(iter.value())));
         }
@@ -542,6 +555,9 @@ impl LsmStorageInner {
             Arc::clone(&guard)
         }; // drop global lock here
 
+        // Scan through memtable, l0 sstables, and l1 sstables
+
+        // memtable
         let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
         memtable_iters.push(Box::new(snapshot.memtable.scan(lower, upper)));
         for memtable in snapshot.imm_memtables.iter() {
@@ -549,7 +565,8 @@ impl LsmStorageInner {
         }
         let memtable_iter = MergeIterator::create(memtable_iters);
 
-        let mut table_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        // l0 sstables
+        let mut l0_iter = Vec::with_capacity(snapshot.l0_sstables.len());
         for table_id in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables[table_id].clone();
 
@@ -577,13 +594,42 @@ impl LsmStorageInner {
                     Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
                 };
 
-                table_iters.push(Box::new(iter));
+                l0_iter.push(Box::new(iter));
+            }
+        }
+        let l0_iter = MergeIterator::create(l0_iter);
+
+        // l1 sstables
+        let mut l1_ssts = Vec::with_capacity(snapshot.levels[0].1.len());
+        for table in snapshot.levels[0].1.iter() {
+            let table = snapshot.sstables[table].clone();
+            if range_overlap(
+                lower,
+                upper,
+                table.first_key().as_key_slice(),
+                table.last_key().as_key_slice(),
+            ) {
+                l1_ssts.push(table);
             }
         }
 
-        let table_iter = MergeIterator::create(table_iters);
+        let l1_iter = match lower {
+            Bound::Included(key) => {
+                SstConcatIterator::create_and_seek_to_key(l1_ssts, Key::from_slice(key))?
+            }
+            Bound::Excluded(key) => {
+                let mut iter =
+                    SstConcatIterator::create_and_seek_to_key(l1_ssts, Key::from_slice(key))?;
+                if iter.is_valid() && iter.key().raw_ref() == key {
+                    iter.next()?;
+                }
+                iter
+            }
+            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(l1_ssts)?,
+        };
 
-        let iter = TwoMergeIterator::create(memtable_iter, table_iter)?;
+        let iter = TwoMergeIterator::create(memtable_iter, l0_iter)?;
+        let iter = TwoMergeIterator::create(iter, l1_iter)?;
 
         Ok(FusedIterator::new(LsmIterator::new(
             iter,
