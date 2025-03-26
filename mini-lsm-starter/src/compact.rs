@@ -333,6 +333,7 @@ impl LsmStorageInner {
         let Some(task) = task else {
             return Ok(());
         };
+        self.dump_structure();
         println!("running compaction task: {:?}", task);
         // Compact the task and get the new sstables
         let sstables = self.compact(&task)?;
@@ -344,34 +345,46 @@ impl LsmStorageInner {
         // 2. Remove the files from the LSMStorageState
         // 3. Delete the files from the disk
         let ssts_to_remove = {
-            let _state_lock = self.state_lock.lock();
-            let (mut snapshot, files_to_remove) = self
-                .compaction_controller
-                .apply_compaction_result(&snapshot, &task, &output, false);
-            let mut ssts_to_remove = Vec::with_capacity(files_to_remove.len());
-            for file_to_remove in &files_to_remove {
-                let result = snapshot.sstables.remove(file_to_remove);
-                assert!(result.is_some());
-                ssts_to_remove.push(result.unwrap());
-            }
+            let state_lock = self.state_lock.lock();
+            let mut snapshot = self.state.read().as_ref().clone();
             let mut new_sst_ids = Vec::new();
             for file_to_add in sstables {
                 new_sst_ids.push(file_to_add.sst_id());
                 let result = snapshot.sstables.insert(file_to_add.sst_id(), file_to_add);
                 assert!(result.is_none());
             }
+            let (mut snapshot, files_to_remove) = self
+                .compaction_controller
+                .apply_compaction_result(&snapshot, &task, &output, false);
+
+            let mut ssts_to_remove = Vec::with_capacity(files_to_remove.len());
+            for file_to_remove in &files_to_remove {
+                let result = snapshot.sstables.remove(file_to_remove);
+                assert!(result.is_some(), "cannot remove {}.sst", file_to_remove);
+                ssts_to_remove.push(result.unwrap());
+            }
+            // Update the LSMStorageState to the new snapshot which contains the new sstables and the removed sstables
             let mut state = self.state.write();
             *state = Arc::new(snapshot);
+            drop(state);
+            self.sync_dir()?;
+            // self.manifest
+            //     .as_ref()
+            //     .unwrap()
+            //     .add_record(&state_lock, ManifestRecord::Compaction(task, new_sst_ids))?;
             ssts_to_remove
         };
         println!(
-            "compaction finished: {} files removed, {} files added",
+            "compaction finished: {} files removed, {} files added, output={:?}",
             ssts_to_remove.len(),
-            files_added
+            output.len(),
+            output
         );
         for sst in ssts_to_remove {
             std::fs::remove_file(self.path_of_sst(sst.sst_id()))?;
         }
+        self.sync_dir()?;
+
         Ok(())
     }
 

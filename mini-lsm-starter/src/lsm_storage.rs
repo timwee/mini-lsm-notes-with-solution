@@ -15,16 +15,16 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::collections::HashMap;
-use std::ops::Bound;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-
 use crate::key::{Key, KeySlice};
 use anyhow::Result;
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
+use std::collections::HashMap;
+use std::fs::File;
+use std::ops::Bound;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use crate::block::Block;
 use crate::compact::{
@@ -340,7 +340,7 @@ impl LsmStorageInner {
             }
         }
 
-        let mut iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
 
         let keep_table = |key: &[u8], table: &SsTable| {
             if key_within(
@@ -362,13 +362,13 @@ impl LsmStorageInner {
         for table in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables[table].clone();
             if keep_table(key, &table) {
-                iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                l0_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
                     table,
                     KeySlice::from_slice(key),
                 )?));
             }
         }
-        let l0_iter = MergeIterator::create(iters);
+        let l0_iter = MergeIterator::create(l0_iters);
 
         // Search on L1 - L_max
         let mut level_iters = Vec::with_capacity(snapshot.levels.len());
@@ -471,7 +471,8 @@ impl LsmStorageInner {
     }
 
     pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
+        File::open(&self.path)?.sync_all()?;
+        Ok(())
     }
 
     /// Force freeze the current memtable to an immutable memtable
@@ -573,7 +574,7 @@ impl LsmStorageInner {
         let memtable_iter = MergeIterator::create(memtable_iters);
 
         // l0 sstables
-        let mut table_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        let mut l0_iter_tables = Vec::with_capacity(snapshot.l0_sstables.len());
         for table_id in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables[table_id].clone();
 
@@ -601,10 +602,10 @@ impl LsmStorageInner {
                     Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
                 };
 
-                table_iters.push(Box::new(iter));
+                l0_iter_tables.push(Box::new(iter));
             }
         }
-        let l0_iter = MergeIterator::create(table_iters);
+        let l0_iter = MergeIterator::create(l0_iter_tables);
 
         // l1 sstables
         let mut l1_ssts = Vec::with_capacity(snapshot.levels[0].1.len());
