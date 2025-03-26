@@ -205,6 +205,51 @@ impl LsmStorageInner {
                 // generate the sstables from the merged iterator
                 self.compact_generate_sst_from_iter(iter, _task.compact_to_bottom_level())
             }
+            CompactionTask::Simple(SimpleLeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level: _,
+                lower_level_sst_ids,
+                ..
+            }) => match upper_level {
+                // Compaction on L1 - L_max
+                Some(_) => {
+                    let mut upper_ssts = Vec::with_capacity(upper_level_sst_ids.len());
+                    for id in upper_level_sst_ids.iter() {
+                        upper_ssts.push(snapshot.sstables.get(id).unwrap().clone());
+                    }
+                    let upper_iter = SstConcatIterator::create_and_seek_to_first(upper_ssts)?;
+                    let mut lower_ssts = Vec::with_capacity(upper_level_sst_ids.len());
+                    for id in lower_level_sst_ids.iter() {
+                        lower_ssts.push(snapshot.sstables.get(id).unwrap().clone());
+                    }
+                    let lower_iter = SstConcatIterator::create_and_seek_to_first(lower_ssts)?;
+                    self.compact_generate_sst_from_iter(
+                        TwoMergeIterator::create(upper_iter, lower_iter)?,
+                        _task.compact_to_bottom_level(),
+                    )
+                }
+                None => {
+                    // Compaction on L0
+                    let mut upper_iters = Vec::with_capacity(upper_level_sst_ids.len());
+                    for id in upper_level_sst_ids.iter() {
+                        upper_iters.push(Box::new(SsTableIterator::create_and_seek_to_first(
+                            snapshot.sstables.get(id).unwrap().clone(),
+                        )?));
+                    }
+                    let upper_iter = MergeIterator::create(upper_iters);
+                    let mut lower_ssts = Vec::with_capacity(upper_level_sst_ids.len());
+                    for id in lower_level_sst_ids.iter() {
+                        lower_ssts.push(snapshot.sstables.get(id).unwrap().clone());
+                    }
+                    let lower_iter = SstConcatIterator::create_and_seek_to_first(lower_ssts)?;
+                    self.compact_generate_sst_from_iter(
+                        TwoMergeIterator::create(upper_iter, lower_iter)?,
+                        _task.compact_to_bottom_level(),
+                    )
+                }
+            },
+
             _ => unimplemented!(),
         }
     }
@@ -269,8 +314,65 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Trigger a compaction task and apply the result to the LSMStorageState
+    /// Will be called by the compaction thread
     fn trigger_compaction(&self) -> Result<()> {
-        unimplemented!()
+        // Overall, the flow of the compaction is as follows:
+        // 1. Generate a compaction task
+        // 2. Compact the task and get the new sstables
+        // 3. Apply the result to the LSMStorageState
+        // 4. Remove the old sstables from the disk
+        let snapshot = {
+            let state = self.state.read();
+            state.clone()
+        };
+        // Generate a compaction task
+        let task = self
+            .compaction_controller
+            .generate_compaction_task(&snapshot);
+        let Some(task) = task else {
+            return Ok(());
+        };
+        println!("running compaction task: {:?}", task);
+        // Compact the task and get the new sstables
+        let sstables = self.compact(&task)?;
+        let files_added = sstables.len();
+        let output = sstables.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
+        // Apply the result to the LSMStorageState
+        // To remove the old sstables, we need to:
+        // 1. Get the files to remove from the compaction result
+        // 2. Remove the files from the LSMStorageState
+        // 3. Delete the files from the disk
+        let ssts_to_remove = {
+            let _state_lock = self.state_lock.lock();
+            let (mut snapshot, files_to_remove) = self
+                .compaction_controller
+                .apply_compaction_result(&snapshot, &task, &output, false);
+            let mut ssts_to_remove = Vec::with_capacity(files_to_remove.len());
+            for file_to_remove in &files_to_remove {
+                let result = snapshot.sstables.remove(file_to_remove);
+                assert!(result.is_some());
+                ssts_to_remove.push(result.unwrap());
+            }
+            let mut new_sst_ids = Vec::new();
+            for file_to_add in sstables {
+                new_sst_ids.push(file_to_add.sst_id());
+                let result = snapshot.sstables.insert(file_to_add.sst_id(), file_to_add);
+                assert!(result.is_none());
+            }
+            let mut state = self.state.write();
+            *state = Arc::new(snapshot);
+            ssts_to_remove
+        };
+        println!(
+            "compaction finished: {} files removed, {} files added",
+            ssts_to_remove.len(),
+            files_added
+        );
+        for sst in ssts_to_remove {
+            std::fs::remove_file(self.path_of_sst(sst.sst_id()))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn spawn_compaction_thread(
