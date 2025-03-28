@@ -206,6 +206,7 @@ impl MiniLsm {
         }
 
         if self.inner.options.enable_wal {
+            // no need to flush memtable to SSTs because WAL itself provides persistence/durability.
             self.inner.sync()?;
             self.inner.sync_dir()?;
             return Ok(());

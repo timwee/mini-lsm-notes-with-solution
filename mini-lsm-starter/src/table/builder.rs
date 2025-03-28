@@ -22,14 +22,14 @@ use anyhow::Result;
 use bytes::BufMut;
 
 use super::{BlockMeta, FileObject, SsTable};
-use crate::key::{Key, KeySlice};
+use crate::key::{KeySlice, KeyVec};
 use crate::{block::BlockBuilder, lsm_storage::BlockCache, table::Bloom};
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
+    first_key: KeyVec,
+    last_key: KeyVec,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
@@ -42,8 +42,8 @@ impl SsTableBuilder {
         Self {
             data: Vec::new(),
             meta: Vec::new(),
-            first_key: Vec::new(),
-            last_key: Vec::new(),
+            first_key: KeyVec::new(),
+            last_key: KeyVec::new(),
             block_size,
             builder: BlockBuilder::new(block_size),
             key_hashes: Vec::new(),
@@ -56,15 +56,14 @@ impl SsTableBuilder {
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         if self.first_key.is_empty() {
-            self.first_key.clear();
-            self.first_key.extend(key.raw_ref());
+            self.first_key.set_from_slice(key);
         }
+
         self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
 
         // if the key-value pair can be added to the current block
         if self.builder.add(key, value) {
-            self.last_key.clear();
-            self.last_key.extend(key.raw_ref());
+            self.last_key.set_from_slice(key);
             return;
         }
 
@@ -73,10 +72,8 @@ impl SsTableBuilder {
 
         // add the key-value pair to the next block
         assert!(self.builder.add(key, value));
-        self.first_key.clear();
-        self.first_key.extend(key.raw_ref());
-        self.last_key.clear();
-        self.last_key.extend(key.raw_ref());
+        self.first_key.set_from_slice(key);
+        self.last_key.set_from_slice(key);
     }
 
     fn finish_block(&mut self) {
@@ -84,10 +81,12 @@ impl SsTableBuilder {
         let encoded_block = builder.build().encode();
         self.meta.push(BlockMeta {
             offset: self.data.len(),
-            first_key: Key::from_bytes(std::mem::take(&mut self.first_key).into()),
-            last_key: Key::from_bytes(std::mem::take(&mut self.last_key).into()),
+            first_key: std::mem::take(&mut self.first_key).into_key_bytes(),
+            last_key: std::mem::take(&mut self.last_key).into_key_bytes(),
         });
+        let checksum = crc32fast::hash(&encoded_block);
         self.data.extend(encoded_block);
+        self.data.put_u32(checksum);
     }
 
     /// Get the estimated size of the SSTable.
@@ -107,12 +106,12 @@ impl SsTableBuilder {
     ) -> Result<SsTable> {
         self.finish_block();
         // encode, format is
-        // -----------------------------------------------------------------------------------------------------
-        // |         Block Section         |                            Meta Section                           |
-        // -----------------------------------------------------------------------------------------------------
-        // | data block | ... | data block | metadata | meta block offset | bloom filter | bloom filter offset |
-        // |                               |  varlen  |         u32       |    varlen    |        u32          |
-        // -----------------------------------------------------------------------------------------------------
+        // ----------------------------------------------------------------------------------------------------------
+        // |                                                  Meta Section                                            |
+        // ----------------------------------------------------------------------------------------------------------
+        // | no. of block | metadata | checksum | meta block offset | bloom filter | checksum | bloom filter offset |
+        // |     u32      |  varlen  |    u32   |        u32        |    varlen    |    u32   |        u32          |
+        // ----------------------------------------------------------------------------------------------------------
 
         // Build and save metadata
         let mut buf = self.data;
