@@ -448,7 +448,7 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        self.state.read().memtable.sync_wal()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -538,47 +538,51 @@ impl LsmStorageInner {
         Ok(None)
     }
 
-    /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        for record in batch {
+            match record {
+                WriteBatchRecord::Del(key) => {
+                    let key = key.as_ref();
+                    assert!(!key.is_empty(), "key cannot be empty");
+                    let size;
+                    {
+                        // take state lock
+                        // To access the memtable, you will need to take the state lock. As our memtable implementation only requires an immutable reference for put, you ONLY need to take the read lock on state in order to modify the memtable. This allows concurrent access to the memtable from multiple threads.
+                        let guard = self.state.read();
+                        // For delete, we write an empty/tombstone value to the memtable
+                        guard.memtable.put(key, b"")?;
+                        size = guard.memtable.approximate_size();
+                    }
+                    self.try_freeze(size)?;
+                }
+                WriteBatchRecord::Put(key, value) => {
+                    let key = key.as_ref();
+                    let value = value.as_ref();
+                    assert!(!key.is_empty(), "key cannot be empty");
+                    assert!(!value.is_empty(), "value cannot be empty");
+                    let size;
+                    {
+                        // take state lock
+                        // To access the memtable, you will need to take the state lock. As our memtable implementation only requires an immutable reference for put, you ONLY need to take the read lock on state in order to modify the memtable. This allows concurrent access to the memtable from multiple threads.
+                        let guard = self.state.read();
+                        guard.memtable.put(key, value)?;
+                        size = guard.memtable.approximate_size();
+                    }
+                    self.try_freeze(size)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        assert!(!_key.is_empty(), "key cannot be empty");
-        assert!(!_value.is_empty(), "value cannot be empty");
-
-        let size: usize;
-        // in smaller scope to release the lock as soon as possible
-        {
-            // take state lock
-            let guard = self.state.read();
-
-            // put into memtable
-            guard.memtable.put(_key, _value)?;
-            size = guard.memtable.approximate_size();
-        }
-        self.try_freeze(size)?;
-        Ok(())
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.write_batch(&[WriteBatchRecord::Put(key, value)])
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        assert!(!_key.is_empty(), "key cannot be empty");
-
-        let size: usize;
-        // in smaller scope to release the lock as soon as possible
-        {
-            // take state lock
-            // To access the memtable, you will need to take the state lock. As our memtable implementation only requires an immutable reference for put, you ONLY need to take the read lock on state in order to modify the memtable. This allows concurrent access to the memtable from multiple threads.
-            let guard = self.state.read();
-            guard.memtable.put(_key, b"")?;
-
-            size = guard.memtable.approximate_size();
-        }
-
-        self.try_freeze(size)?;
-        Ok(())
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.write_batch(&[WriteBatchRecord::Del(key)])
     }
 
     /// uses "double-checked locking" to avoid unnecessary freezing
@@ -649,6 +653,7 @@ impl LsmStorageInner {
 
         self.freeze_memtable_with_memtable(memtable)?;
 
+        // add NewMemtable record to manifest
         self.manifest.as_ref().unwrap().add_record(
             state_lock_observer,
             ManifestRecord::NewMemtable(memtable_id),
@@ -707,9 +712,9 @@ impl LsmStorageInner {
             *guard = Arc::new(snapshot);
         }
 
-        // if self.options.enable_wal {
-        //     std::fs::remove_file(self.path_of_wal(sst_id))?;
-        // }
+        if self.options.enable_wal {
+            std::fs::remove_file(self.path_of_wal(sst_id))?;
+        }
 
         self.manifest
             .as_ref()
