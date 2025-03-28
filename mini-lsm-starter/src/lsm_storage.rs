@@ -531,7 +531,14 @@ impl LsmStorageInner {
             let mem = snapshot.imm_memtables.pop().unwrap();
             assert_eq!(mem.id(), sst_id);
             // Add L0 table
-            snapshot.l0_sstables.insert(0, sst_id);
+            // Add L0 table
+            if self.compaction_controller.flush_to_l0() {
+                // In leveled compaction or no compaction, simply flush to L0
+                snapshot.l0_sstables.insert(0, sst_id);
+            } else {
+                // In tiered compaction, create a new tier
+                snapshot.levels.insert(0, (sst_id, vec![sst_id]));
+            }
             println!("flushed {}.sst with size={}", sst_id, sst.table_size());
             snapshot.sstables.insert(sst_id, sst);
             // Update the snapshot.
@@ -608,18 +615,18 @@ impl LsmStorageInner {
         let l0_iter = MergeIterator::create(l0_iter_tables);
 
         // l1 sstables
-        let mut l1_ssts = Vec::with_capacity(snapshot.levels[0].1.len());
-        for table in snapshot.levels[0].1.iter() {
-            let table = snapshot.sstables[table].clone();
-            if range_overlap(
-                lower,
-                upper,
-                table.first_key().as_key_slice(),
-                table.last_key().as_key_slice(),
-            ) {
-                l1_ssts.push(table);
-            }
-        }
+        // let mut l1_ssts = Vec::with_capacity(snapshot.levels[0].1.len());
+        // for table in snapshot.levels[0].1.iter() {
+        //     let table = snapshot.sstables[table].clone();
+        //     if range_overlap(
+        //         lower,
+        //         upper,
+        //         table.first_key().as_key_slice(),
+        //         table.last_key().as_key_slice(),
+        //     ) {
+        //         l1_ssts.push(table);
+        //     }
+        // }
 
         // Search on L1 - L_max
         let mut level_iters = Vec::with_capacity(snapshot.levels.len());

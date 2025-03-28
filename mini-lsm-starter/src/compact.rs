@@ -211,6 +211,13 @@ impl LsmStorageInner {
                 lower_level: _,
                 lower_level_sst_ids,
                 ..
+            })
+            | CompactionTask::Leveled(LeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level: _,
+                lower_level_sst_ids,
+                ..
             }) => match upper_level {
                 // Compaction on L1 - L_max
                 Some(_) => {
@@ -249,8 +256,20 @@ impl LsmStorageInner {
                     )
                 }
             },
-
-            _ => unimplemented!(),
+            CompactionTask::Tiered(TieredCompactionTask { tiers, .. }) => {
+                let mut iters = Vec::with_capacity(tiers.len());
+                for (_, tier_sst_ids) in tiers {
+                    let mut ssts = Vec::with_capacity(tier_sst_ids.len());
+                    for id in tier_sst_ids.iter() {
+                        ssts.push(snapshot.sstables.get(id).unwrap().clone());
+                    }
+                    iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(ssts)?));
+                }
+                self.compact_generate_sst_from_iter(
+                    MergeIterator::create(iters),
+                    _task.compact_to_bottom_level(),
+                )
+            }
         }
     }
 
@@ -259,7 +278,6 @@ impl LsmStorageInner {
             panic!("full compaction can only be called with compaction is not enabled")
         };
 
-        // grab the snapshot of the current state of sstables
         let snapshot = {
             let state = self.state.read();
             state.clone()
@@ -272,32 +290,26 @@ impl LsmStorageInner {
             l1_sstables: l1_sstables.clone(),
         };
 
-        // do the compaction on all the l0 and l1 sstables
-        let sstables = self.compact(&compaction_task)?;
+        println!("force full compaction: {:?}", compaction_task);
 
-        // Update LSMStorageState with the new compacted sstables
-        // remove the old sstables
-        // We need to grab the state_lock here since we're updating metadata
+        let sstables = self.compact(&compaction_task)?;
+        let mut ids = Vec::with_capacity(sstables.len());
+
         {
-            let _state_lock = self.state_lock.lock();
+            let state_lock = self.state_lock.lock();
             let mut state = self.state.read().as_ref().clone();
             for sst in l0_sstables.iter().chain(l1_sstables.iter()) {
                 let result = state.sstables.remove(sst);
                 assert!(result.is_some());
             }
-            let mut ids = Vec::with_capacity(sstables.len());
             for new_sst in sstables {
                 ids.push(new_sst.sst_id());
                 let result = state.sstables.insert(new_sst.sst_id(), new_sst);
                 assert!(result.is_none());
             }
-            // We assume that there is only 1 compaction task at a time
-            // This is just a sanity check to make sure that no one else is modifying l1 sstables
             assert_eq!(l1_sstables, state.levels[0].1);
-            state.levels[0].1 = ids;
-            // Get the compacted l0 sstables
+            state.levels[0].1.clone_from(&ids);
             let mut l0_sstables_map = l0_sstables.iter().copied().collect::<HashSet<_>>();
-            // remove the compacted l0 sstables from the state
             state.l0_sstables = state
                 .l0_sstables
                 .iter()
@@ -306,11 +318,18 @@ impl LsmStorageInner {
                 .collect::<Vec<_>>();
             assert!(l0_sstables_map.is_empty());
             *self.state.write() = Arc::new(state);
+            self.sync_dir()?;
+            //     self.manifest.as_ref().unwrap().add_record(
+            //         &state_lock,
+            //         ManifestRecord::Compaction(compaction_task, ids.clone()),
+            //     )?;
         }
-        // remove the old sstables from the disk
         for sst in l0_sstables.iter().chain(l1_sstables.iter()) {
             std::fs::remove_file(self.path_of_sst(*sst))?;
         }
+
+        println!("force full compaction done, new SSTs: {:?}", ids);
+
         Ok(())
     }
 
