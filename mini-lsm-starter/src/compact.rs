@@ -19,6 +19,7 @@ mod leveled;
 mod simple_leveled;
 mod tiered;
 
+use crate::manifest::ManifestRecord;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -257,6 +258,7 @@ impl LsmStorageInner {
                 }
             },
             CompactionTask::Tiered(TieredCompactionTask { tiers, .. }) => {
+                // Grab all the sstables for the tiers given by the compaction task and merge them into a single iterator
                 let mut iters = Vec::with_capacity(tiers.len());
                 for (_, tier_sst_ids) in tiers {
                     let mut ssts = Vec::with_capacity(tier_sst_ids.len());
@@ -319,10 +321,10 @@ impl LsmStorageInner {
             assert!(l0_sstables_map.is_empty());
             *self.state.write() = Arc::new(state);
             self.sync_dir()?;
-            //     self.manifest.as_ref().unwrap().add_record(
-            //         &state_lock,
-            //         ManifestRecord::Compaction(compaction_task, ids.clone()),
-            //     )?;
+            self.manifest.as_ref().unwrap().add_record(
+                &state_lock,
+                ManifestRecord::Compaction(compaction_task, ids.clone()),
+            )?;
         }
         for sst in l0_sstables.iter().chain(l1_sstables.iter()) {
             std::fs::remove_file(self.path_of_sst(*sst))?;
@@ -387,10 +389,10 @@ impl LsmStorageInner {
             *state = Arc::new(snapshot);
             drop(state);
             self.sync_dir()?;
-            // self.manifest
-            //     .as_ref()
-            //     .unwrap()
-            //     .add_record(&state_lock, ManifestRecord::Compaction(task, new_sst_ids))?;
+            self.manifest
+                .as_ref()
+                .unwrap()
+                .add_record(&state_lock, ManifestRecord::Compaction(task, new_sst_ids))?;
             ssts_to_remove
         };
         println!(

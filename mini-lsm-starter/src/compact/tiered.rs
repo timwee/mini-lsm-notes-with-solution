@@ -53,6 +53,7 @@ impl TieredCompactionController {
         if snapshot.levels.len() < self.options.num_tiers {
             return None;
         }
+        // For each of the triggers below, pay attention to what gets passed into the tiers for the compaction task
         // compaction triggered by space amplification ratio
         let mut size = 0;
         for id in 0..(snapshot.levels.len() - 1) {
